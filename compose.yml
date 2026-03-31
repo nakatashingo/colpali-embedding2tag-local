@@ -3,17 +3,16 @@ services:
     build:
       context: .
       dockerfile: .docker/nvidia-cuda-12.4.1-ubuntu22.04.Dockerfile
-    container_name: 'nvidia-docker_241'
     stdin_open: true
     tty: true
     volumes:
-      - ./:/app
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           capabilities: [gpu]
+      - ./workspace:/workspace
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
