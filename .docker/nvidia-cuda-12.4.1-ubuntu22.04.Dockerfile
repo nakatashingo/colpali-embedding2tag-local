@@ -20,7 +20,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # pyproject.toml をコピーして依存関係をインストール
-COPY workspace/pyproject.toml /workspace/
-RUN uv sync
+COPY workspace/pyproject.toml workspace/uv.lock /workspace/
+RUN uv sync --frozen
 
 CMD ["bash"]
