@@ -1,0 +1,24 @@
+[project]
+name = "tml-workspace"
+version = "0.1.0"
+description = "TMLlab GPU research workspace (CUDA 12.4 + PyTorch 2.4.1)"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "torch==2.4.1",
+    "torchvision==0.19.1",
+    "torchaudio==2.4.1",
+    "tensorflow==2.18",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[dependency-groups]
+dev = ["ruff"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }

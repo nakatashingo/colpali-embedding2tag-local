@@ -6,13 +6,13 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - ./:/app
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           capabilities: [gpu]
+      - ./workspace:/workspace
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
