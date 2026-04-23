@@ -1,8 +1,8 @@
 # ============================================================
-# RVL-CDIP × ColPali × 16-class evaluation
-# - DocVQAベースのコードをRVL-CDIPに適応
-# - 弱ラベル生成を削除し、既存ラベルを使用
-# - 16クラス文書分類（シングルラベル）
+# RVL-CDIP × ColPali × 自己教師あり学習
+# - 訓練: 正解ラベル不使用（MaxSim / InfoNCE / MSE / Diversity）
+# - 検証: 正解ラベルで F1・精度を観察（選択基準は val 自己損失）
+# - 推論時はタグ名定義と画像のみで任意データに適用可能
 # ============================================================
 
 import os
@@ -113,8 +113,7 @@ TAGS = [
 ]
 TAG_TO_ID = {t: i for i, t in enumerate(TAGS)}
 
-# 損失重み
-W_BCE = 1.0
+# 損失重み（訓練は自己教師あり損失のみ）
 W_MAXSIM = 1.0
 W_INFNCE = 0.5
 W_MSE = 0.1
@@ -138,6 +137,8 @@ def cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def show_mem(tag=""):
@@ -314,16 +315,43 @@ cleanup()
 # 6. encode images -> shard files
 # =========================
 @torch.no_grad()
+def _encode_single(img: Image.Image) -> torch.Tensor:
+    inputs = processor(images=[img], return_tensors="pt").to(model.device)
+    out = model(**inputs)
+    mv = out.embeddings.detach().to("cpu")
+    del inputs, out
+    if _mps_mode:
+        torch.mps.synchronize()
+    cleanup()
+    return mv  # [1, P, D]
+
+
 def encode_images_mv(pil_images: List[Image.Image], batch_size: int = 2) -> torch.Tensor:
     embs = []
     for i in range(0, len(pil_images), batch_size):
         batch = pil_images[i : i + batch_size]
-        inputs = processor(images=batch, return_tensors="pt").to(model.device)
-        out = model(**inputs)
-        mv = out.embeddings  # [B, P, D]
-        embs.append(mv.detach().to("cpu"))
-        del inputs, out, mv
-        cleanup()
+
+        try:
+            inputs = processor(images=batch, return_tensors="pt").to(model.device)
+            out = model(**inputs)
+            mv = out.embeddings  # [B, P, D]
+            embs.append(mv.detach().to("cpu"))
+            del inputs, out, mv
+            if _mps_mode:
+                torch.mps.synchronize()
+            cleanup()
+        except Exception as e:
+            print(f"  batch encode failed: {e}  → retrying one-by-one")
+            try:
+                del inputs, out, mv
+            except Exception:
+                pass
+            if _mps_mode:
+                torch.mps.synchronize()
+            cleanup()
+            # 1枚ずつ処理してメモリ圧力を下げる
+            for img in batch:
+                embs.append(_encode_single(img))
 
         if (i // batch_size) % 20 == 0:
             print(f"encoded {min(i + len(batch), len(pil_images))}/{len(pil_images)}")
@@ -454,8 +482,6 @@ opt = torch.optim.AdamW(tagger.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
 tag_matrix_dev = tag_matrix.to(device)
 
-bce_loss_fn = nn.BCEWithLogitsLoss()
-
 
 def page_logits_from_slot_logits(slot_logits: torch.Tensor) -> torch.Tensor:
     return slot_logits.max(dim=1)[0]
@@ -483,6 +509,14 @@ def maxsim_loss(pred_vecs: torch.Tensor, img_mv: torch.Tensor) -> torch.Tensor:
     return -maxsim_per_query.mean()
 
 
+def infonce_loss(pred_vecs: torch.Tensor, img_mv: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    pred_pooled = F.normalize(pred_vecs.mean(dim=1), dim=-1)   # [B, D]
+    img_pooled = F.normalize(img_mv.mean(dim=1), dim=-1)        # [B, D]
+    sim = pred_pooled @ img_pooled.T / temperature              # [B, B]
+    labels = torch.arange(sim.size(0), device=sim.device)
+    return (F.cross_entropy(sim, labels) + F.cross_entropy(sim.T, labels)) / 2
+
+
 def diversity_loss(pred_vecs: torch.Tensor) -> torch.Tensor:
     B, Q, D = pred_vecs.shape
     pred_vecs_norm = F.normalize(pred_vecs, dim=-1)
@@ -490,14 +524,54 @@ def diversity_loss(pred_vecs: torch.Tensor) -> torch.Tensor:
     sim = torch.matmul(pred_vecs_norm.view(B * Q, D), pred_vecs_norm.view(B * Q, D).T)
     sim = sim.view(B, Q, B, Q)
     
-    mask = torch.eye(Q, device=sim.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
+    mask = torch.eye(B * Q, device=sim.device, dtype=torch.bool).view(B, Q, B, Q)
     sim_masked = sim.masked_fill(mask, 0.0)
     
     return sim_masked.abs().mean()
 
 
 # =========================
-# 9. predict from shards
+# 9. self-supervised val loss
+# =========================
+@torch.no_grad()
+def compute_val_self_loss(shard_paths: List[str]) -> float:
+    tagger.eval()
+    total = 0.0
+    n = 0
+    for shard_path in shard_paths:
+        shard = torch.load(shard_path, map_location="cpu")
+        mv = shard["mv"]
+        dataset = TensorDataset(mv)
+        loader = DataLoader(
+            dataset,
+            batch_size=min(VAL_LOADER_BATCH, len(dataset)),
+            shuffle=False,
+            drop_last=True,
+        )
+        for (batch_mv_cpu,) in loader:
+            img_mv_b = batch_mv_cpu.to(device=device, dtype=torch.float32)
+            img_mv_b = subsample_patches(img_mv_b, max_patches=MAX_PATCHES, deterministic=True)
+            slot_logits = tagger(img_mv_b)
+            pred_tag_vec = logits_to_pred_vec(slot_logits, tag_matrix_dev)
+            pooled_img = img_mv_b.mean(dim=1)
+            pooled_pred = pred_tag_vec.mean(dim=1)
+            loss = (
+                W_MAXSIM * maxsim_loss(pred_tag_vec, img_mv_b)
+                + W_INFNCE * infonce_loss(pred_tag_vec, img_mv_b)
+                + W_MSE * F.mse_loss(pooled_pred, pooled_img)
+                + W_DIV * diversity_loss(pred_tag_vec)
+            )
+            total += float(loss.item())
+            n += 1
+            del img_mv_b, slot_logits, pred_tag_vec, pooled_img, pooled_pred, loss
+            cleanup()
+        del shard, mv
+        cleanup()
+    return total / max(n, 1)
+
+
+# =========================
+# 10. predict from shards
 # =========================
 @torch.no_grad()
 def predict_from_shards(shard_paths: List[str], threshold: float = 0.5):
@@ -621,9 +695,9 @@ def decode_multi_hot(y: torch.Tensor, tag_names: List[str]) -> List[List[str]]:
 
 
 # =========================
-# 10. training loop
+# 11. training loop
 # =========================
-best_val_micro_f1_ckpt = -1.0
+best_val_self_loss = float("inf")
 
 for epoch in range(1, EPOCHS + 1):
     tagger.train()
@@ -633,9 +707,8 @@ for epoch in range(1, EPOCHS + 1):
     for shard_path in train_shards:
         shard = torch.load(shard_path, map_location="cpu")
         train_mv = shard["mv"]
-        train_y = shard["labels"].float()
 
-        dataset = TensorDataset(train_mv, train_y)
+        dataset = TensorDataset(train_mv)
         batch_size = min(TRAIN_LOADER_BATCH, len(dataset))
         loader = DataLoader(
             dataset,
@@ -644,28 +717,24 @@ for epoch in range(1, EPOCHS + 1):
             drop_last=(len(dataset) > 1),
         )
 
-        for batch_mv_cpu, batch_y_cpu in loader:
+        for (batch_mv_cpu,) in loader:
             img_mv_b = batch_mv_cpu.to(device=device, dtype=torch.float32)
-            y_b = batch_y_cpu.to(device=device, dtype=torch.float32)
-
             img_mv_b = subsample_patches(img_mv_b, max_patches=MAX_PATCHES, deterministic=False)
 
             slot_logits = tagger(img_mv_b)
-            page_logits = page_logits_from_slot_logits(slot_logits)
             pred_tag_vec = logits_to_pred_vec(slot_logits, tag_matrix_dev)
-
             pooled_img = img_mv_b.mean(dim=1)
             pooled_pred = pred_tag_vec.mean(dim=1)
 
-            loss_cls = bce_loss_fn(page_logits, y_b)
             loss_mse = F.mse_loss(pooled_pred, pooled_img)
             loss_max = maxsim_loss(pred_tag_vec, img_mv_b)
             loss_div = diversity_loss(pred_tag_vec)
+            loss_nce = infonce_loss(pred_tag_vec, img_mv_b)
 
             loss = (
-                W_BCE * loss_cls
+                W_MAXSIM * loss_max
+                + W_INFNCE * loss_nce
                 + W_MSE * loss_mse
-                + W_MAXSIM * loss_max
                 + W_DIV * loss_div
             )
 
@@ -677,13 +746,17 @@ for epoch in range(1, EPOCHS + 1):
             total += float(loss.item())
             n += 1
 
-            del img_mv_b, y_b, slot_logits, page_logits, pred_tag_vec
-            del pooled_img, pooled_pred, loss_cls, loss_mse, loss_max, loss_div, loss
+            del img_mv_b, slot_logits, pred_tag_vec
+            del pooled_img, pooled_pred, loss_mse, loss_max, loss_div, loss_nce, loss
             cleanup()
 
-        del shard, train_mv, train_y, dataset, loader
+        del shard, train_mv, dataset, loader
         cleanup()
 
+    # val 自己損失（モデル選択基準）
+    val_self_loss = compute_val_self_loss(val_shards)
+
+    # val メトリクス（観察用のみ、学習には不使用）
     best_thr, _ = find_best_threshold(val_shards)
     val_probs, val_preds, val_true, _ = predict_from_shards(val_shards, threshold=best_thr)
     val_metrics = compute_metrics(val_true, val_probs, val_preds)
@@ -691,11 +764,11 @@ for epoch in range(1, EPOCHS + 1):
     val_micro_f1 = val_metrics['micro_f1']
     val_acc = val_metrics['single_label_accuracy']
     print(
-        f"epoch={epoch:02d}，"
-        f"train_loss={total/max(n,1):.4f}，"
-        f"val_acc={val_acc:.4f}，"
-        f"val_micro_f1={val_micro_f1:.4f}，"
-        f"val_macro_f1={val_metrics['macro_f1']:.4f}，"
+        f"epoch={epoch:02d}  "
+        f"train_loss={total/max(n,1):.4f}  "
+        f"val_self_loss={val_self_loss:.4f}  "
+        f"[観察] val_acc={val_acc:.4f}  "
+        f"val_micro_f1={val_micro_f1:.4f}  "
         f"best_thr={best_thr:.2f}"
     )
 
@@ -705,6 +778,7 @@ for epoch in range(1, EPOCHS + 1):
         "tagger_state_dict": tagger.state_dict(),
         "optimizer_state_dict": opt.state_dict(),
         "best_thr": best_thr,
+        "val_self_loss": val_self_loss,
         "val_metrics": val_metrics,
         "config": {
             "MODEL_NAME": MODEL_NAME, "RVLCDIP_NAME": RVLCDIP_NAME,
@@ -712,23 +786,23 @@ for epoch in range(1, EPOCHS + 1):
             "MAX_PATCHES": MAX_PATCHES, "N_QUERIES": N_QUERIES, "N_HEADS": N_HEADS,
             "EPOCHS": EPOCHS, "LR": LR, "WEIGHT_DECAY": WEIGHT_DECAY,
             "TRAIN_LOADER_BATCH": TRAIN_LOADER_BATCH, "SHARD_SIZE": SHARD_SIZE,
-            "W_BCE": W_BCE, "W_MAXSIM": W_MAXSIM, "W_INFNCE": W_INFNCE,
+            "W_MAXSIM": W_MAXSIM, "W_INFNCE": W_INFNCE,
             "W_MSE": W_MSE, "W_DIV": W_DIV,
         },
     }
     torch.save(ckpt, CKPT_DIR / f"epoch_{epoch:02d}.pt")
 
-    if val_micro_f1 > best_val_micro_f1_ckpt:
-        best_val_micro_f1_ckpt = val_micro_f1
+    if val_self_loss < best_val_self_loss:
+        best_val_self_loss = val_self_loss
         torch.save(ckpt, CKPT_DIR / "best.pt")
-        print(f"  -> best model updated (micro_f1={val_micro_f1:.4f}, acc={val_acc:.4f})")
+        print(f"  -> best model updated (val_self_loss={val_self_loss:.4f}, [観察] acc={val_acc:.4f})")
 
     del val_probs, val_preds, val_true, val_metrics
     cleanup()
 
 
 # =========================
-# 11. final evaluation
+# 12. final evaluation
 # =========================
 best_thr, best_val_micro_f1 = find_best_threshold(val_shards)
 val_probs, val_preds, val_true, val_meta = predict_from_shards(val_shards, threshold=best_thr)
@@ -764,7 +838,7 @@ for i in range(min(10, len(val_meta))):
 
 
 # =========================
-# 12. save outputs
+# 13. save outputs
 # =========================
 _config = {
     "MODEL_NAME": MODEL_NAME, "RVLCDIP_NAME": RVLCDIP_NAME,
@@ -772,7 +846,7 @@ _config = {
     "MAX_PATCHES": MAX_PATCHES, "N_QUERIES": N_QUERIES, "N_HEADS": N_HEADS,
     "EPOCHS": EPOCHS, "LR": LR, "WEIGHT_DECAY": WEIGHT_DECAY,
     "TRAIN_LOADER_BATCH": TRAIN_LOADER_BATCH, "SHARD_SIZE": SHARD_SIZE,
-    "W_BCE": W_BCE, "W_MAXSIM": W_MAXSIM, "W_INFNCE": W_INFNCE,
+    "W_MAXSIM": W_MAXSIM, "W_INFNCE": W_INFNCE,
     "W_MSE": W_MSE, "W_DIV": W_DIV,
     "SEED": SEED,
 }

@@ -1,15 +1,15 @@
 [project]
 name = "tml-workspace"
 version = "0.1.0"
-description = "TMLlab GPU research workspace (CUDA 12.4 + PyTorch 2.4.1)"
+description = "TMLlab research workspace (CUDA / MPS / CPU)"
 requires-python = ">=3.12, <3.13"
 dependencies = [
-    "torch==2.4.1",
-    "torchvision==0.19.1",
-    "torchaudio==2.4.1",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "torchaudio>=2.6.0",
     "tensorflow==2.18",
     "transformers>=4.45.0",
-    "datasets>=2.18.0",
+    "datasets>=2.18.0,<3.0.0",
     "pillow>=10.0.0",
     "psutil>=5.9.0",
     "scikit-learn>=1.3.0",
@@ -19,14 +19,20 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [dependency-groups]
 dev = ["ruff"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
-torchaudio = { index = "pytorch-cu124" }
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
