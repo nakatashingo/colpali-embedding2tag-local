@@ -71,9 +71,9 @@ except Exception as e:
 MODEL_NAME = "vidore/colpali-v1.3-hf"
 RVLCDIP_NAME = "aharley/rvl_cdip"
 
-# データセットサイズ（小規模テスト用）
-MAX_TRAIN_ROWS = 12000  # または 320000 でフルデータセット
-MAX_VAL_ROWS = 3000     # または 40000 でフルデータセット
+# データセットサイズ
+MAX_TRAIN_ROWS = 12000  # フルは 320000
+MAX_VAL_ROWS = 3000     # フルは 40000
 
 TRAIN_IMAGE_ENCODE_BATCH = 2
 VAL_IMAGE_ENCODE_BATCH = 2
@@ -85,9 +85,9 @@ EPOCHS = 12
 LR = 3e-4
 WEIGHT_DECAY = 1e-2
 
-TRAIN_LOADER_BATCH = 8
-VAL_LOADER_BATCH = 8
-SHARD_SIZE = 200
+TRAIN_LOADER_BATCH = 16  # 訓練バッチサイズ増加
+VAL_LOADER_BATCH = 16
+SHARD_SIZE = 100        # シャードを小さくしてRAMスパイクを抑制
 OVERWRITE_CACHE = False
 IMAGE_SAVE_FORMAT = "PNG"
 SEED = 42
